@@ -22,8 +22,9 @@ import qcore.errors as core_errors
 
 from . import debug
 from . import futures
-from . import scheduler
 from . import _debug
+
+import asynq
 
 __traceback_hide__ = True
 
@@ -51,7 +52,7 @@ class AsyncTask(futures.FutureBase):
 
     """
 
-    def __init__(self, generator, fn, args, kwargs, group_cancel=True, max_depth=0):
+    def __init__(self, generator, fn, args, kwargs):
         super(AsyncTask, self).__init__()
         if _debug_options.ENABLE_COMPLEX_ASSERTIONS:
             assert core_inspection.is_cython_or_generator(generator), \
@@ -59,25 +60,21 @@ class AsyncTask(futures.FutureBase):
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
-        self.is_scheduled = False
         self.iteration_index = 0
-        self.group_cancel = group_cancel
         self.caller = None
-        self.depth = 0
-        self.max_depth = max_depth
-        self.scheduler = None
-        self.creator = scheduler.get_active_task()
         self._generator = generator
-        self._frame_info = None
+        self._frame = None
         self._last_value = None
-        self._dependencies = set()
-        if self.creator is None:
-            self._contexts = []
-        else:
-            self._contexts = list(self.creator._contexts)
+        self._dependencies = []
+        self._contexts = []
+        self._contexts_active = False
+        self._dependencies_scheduled = False
         if _debug_options.DUMP_NEW_TASKS:
+            self.creator = asynq.scheduler.get_active_task()
             debug.write('@async: new task: %s, created by %s' %
                 (debug.str(self), debug.str(self.creator)))
+        elif _debug_options.DUMP_SYNC_CALLS:
+            self.creator = asynq.scheduler.get_active_task()
 
     def can_continue(self):
         """Indicates whether this async task has more steps to execute.
@@ -93,46 +90,18 @@ class AsyncTask(futures.FutureBase):
         tasks or batches.
 
         """
-        return True if self._dependencies else False
-
-    def start(self, run_immediately=False):
-        """
-        Starts the task on the current task scheduler.
-        Newly created tasks aren't started by default.
-
-        :param run_immediately: indicates whether first iteration
-            over the generator must be performed immediately
-        :return: self
-
-        """
-        s = scheduler.get_scheduler()
-        return s.start(self, run_immediately)
-
-    def after(self, future):
-        """Starts the task after specified future gets computed.
-
-        :param future: future that must be computed
-        :return: self
-
-        """
-        s = scheduler.get_scheduler()
-        return s.continue_with(future, self)
-
-    def cancel_dependencies(self, error):
-        if not self._dependencies:
-            return
-        dependencies = list(self._dependencies)
-        cancellation_error = error if isinstance(error, AsyncTaskCancelledError) else AsyncTaskCancelledError(error)
-        if _debug_options.DUMP_DEPENDENCIES:
-            debug.write('@async: -> cancelling dependencies of %s:' % debug.str(self))
-        for dependency in dependencies:
-            _cancel_futures(dependency, cancellation_error)
-        if _debug_options.DUMP_DEPENDENCIES:
-            debug.write('@async: <- cancelled dependencies of %s' % debug.str(self))
+        for dependency in self._dependencies:
+            if not dependency.is_computed():
+                return True
+        return False
 
     def _compute(self):
+        if _debug_options.DUMP_SYNC_CALLS:
+            if self.creator is not None:
+                debug.write('@async: %s called synchronously from %s'
+                    % (debug.str(self), debug.str(self.creator)))
         # Forwards the call to task scheduler
-        scheduler.get_scheduler().await([self])
+        asynq.scheduler.get_scheduler().await(self)
         # No need to assign a value/error here, since
         # _continue method (called by TaskScheduler) does this.
 
@@ -143,13 +112,12 @@ class AsyncTask(futures.FutureBase):
                 self._generator = None
         finally:
             # super() doesn't work in Cython-ed version here
+            self._dependencies = []
+            self._last_value = None
             futures.FutureBase._computed(self)
             error = self.error()
-            if error is not None and self.group_cancel:
-                self.cancel_dependencies(error)
 
     def _continue(self):
-        self._before_continue()
         # Obvious optimization: we don't need to return from
         # this method, if we still can go further after yield.
         # So we return only if there are dependencies or
@@ -164,13 +132,14 @@ class AsyncTask(futures.FutureBase):
             try:
                 self._accept_yield_result(self._continue_on_generator(value, error))
             except StopIteration as error:  # Most frequent, so it's the first one
-                if hasattr(error, 'value'):
+                try:
                     # We're on a Python version that supports adding a value to StopIteration
-                    self._queue_exit(error.value)
-                else:
+                    return_value = error.value
+                except AttributeError:
                     # This means there was no asynq.result() call, so the value of
                     # this task should be None
-                    self._queue_exit(None)
+                    return_value = None
+                self._queue_exit(return_value)
             except GeneratorExit as error:
                 error_type = type(error)
                 if error_type is AsyncTaskResult:
@@ -181,10 +150,11 @@ class AsyncTask(futures.FutureBase):
                     self._queue_exit(None)
             except BaseException as error:
                 self._accept_error(error)
-            finally:
-                if self._dependencies or self.is_computed():
-                    self._after_continue()
-                    return
+
+            if self.is_computed():
+                return
+            if len(self._dependencies) > 0:
+                return
 
     def _continue_on_generator(self, value, error):
         try:
@@ -199,7 +169,7 @@ class AsyncTask(futures.FutureBase):
                 return self._generator.send(value)
             else:
                 self._last_value = None  # No need to keep it further
-                self._frame_info = debug.get_frame_info(self._generator)
+                self._frame = debug.get_frame(self._generator)
                 if hasattr(error, '_task'):
                     return self._generator.throw(error._type_, error, error._traceback)
                 else:
@@ -218,12 +188,12 @@ class AsyncTask(futures.FutureBase):
             # If the task failed, we want to save the frame info here so that the traceback can
             # show where in the async task the failure happened. However, if the error was thrown
             # into the generator, we'll already have set the frame info.
-            if self._frame_info is None:
+            if self._frame is None:
                 tb = sys.exc_info()[2]
 
                 while tb.tb_next is not None:
                     tb = tb.tb_next
-                self._frame_info = inspect.getframeinfo(tb.tb_frame)
+                self._frame = tb.tb_frame
             self._generator = None
             raise
 
@@ -231,7 +201,7 @@ class AsyncTask(futures.FutureBase):
         if _debug_options.DUMP_YIELD_RESULTS:
             debug.write('@async: yield: %s -> %s' % (debug.str(self), debug.repr(result)))
         self._last_value = result
-        self.scheduler.add_dependencies(self, result)
+        extract_futures(result, self._dependencies)
 
     def _accept_error(self, error):
         if self._value is not _futures_none:  # is_computed(), but faster
@@ -262,83 +232,29 @@ class AsyncTask(futures.FutureBase):
             self._queue_throw_error(error)
 
     def _queue_exit(self, result):
-        # Result must be unwrapped first,
-        # and since there can be dependencies, the error result (exception)
-        # is still possible at this point.
-        #
-        # So we can't instantly close the generator here, since if there is
-        # an error during dependency computation, we must re-throw it
-        # from the generator.
+        # Result must be unwrapped first.
+        # All of the dependencies must have been computed at this point.
         if self._value is not _futures_none:  # is_computed(), but faster
             raise futures.FutureIsAlreadyComputed(self)
         if self._generator is not None:
             self._generator.close()
             self._generator = None
-        if self._dependencies:  # is_blocked(), but faster
-            if _debug_options.DUMP_QUEUED_RESULTS:
-                debug.write('@async: queuing exit: %s <- %s' % (debug.repr(result), debug.str(self)))
-            self._last_value = result
-        else:
-            self.set_value(result)
+        if _debug_options.DUMP_QUEUED_RESULTS:
+            debug.write('@async: queuing exit: %s <- %s' % (debug.repr(result), debug.str(self)))
+        self.set_value(result)
 
     def _queue_throw_error(self, error):
         if self._value is not _futures_none:  # is_computed(), but faster
             raise futures.FutureIsAlreadyComputed(self)
-        if self._generator is not None or self._dependencies:  # can_continue() or is_blocked(), but faster
-            if _debug_options.DUMP_QUEUED_RESULTS:
-                debug.write('@async: queuing throw error: %s <-x- %s' % (debug.repr(error), debug.str(self)))
-            self._last_value = futures.ErrorFuture(error)  # To get it re-thrown on unwrap
-            if self.group_cancel:
-                self.cancel_dependencies(error)
-        else:
-            self.set_error(error)
-
-    def _remove_dependency(self, dependency):
-        self._remove_dependency_cython(dependency)
-
-    def _remove_dependency_cython(self, dependency):
-        if _debug_options.DUMP_DEPENDENCIES:
-            debug.write('@async: -dependency: %s got %s' % (debug.str(self), debug.str(dependency)))
-        self._dependencies.remove(dependency)
-        if self._value is _futures_none:  # not is_computed(), but faster
-            try:
-                error = dependency.error()
-                if not (error is None or isinstance(error, AsyncTaskCancelledError)):
-                    self._queue_throw_error(error)
-            finally:
-                if not self._dependencies:  # not is_blocked(), but faster
-                    self.scheduler._schedule_without_checks(self)
-
-    def make_dependency(self, task, scheduler):
-        """Mark self as a dependency on task.
-
-        i.e. self needs to be computed before task can be continued further.
-
-        """
-        self.depth = task.depth + 1
-        if self.max_depth == 0:
-            self.max_depth = task.max_depth
-        if self.max_depth != 0:
-            if self.depth > self.max_depth:
-                debug.dump(scheduler)
-                assert False, \
-                    "Task stack depth exceeded specified maximum (%i)" % self.max_depth
-        self.caller = task
-        task._dependencies.add(self)
-        self.on_computed.subscribe(task._remove_dependency)
-        scheduler.schedule(self)
-
-    def _before_continue(self):
-        self._resume_contexts()
-
-    def _after_continue(self):
-        self._pause_contexts()
+        if _debug_options.DUMP_QUEUED_RESULTS:
+            debug.write('@async: queuing throw error: %s <-x- %s' % (debug.repr(error), debug.str(self)))
+        self.set_error(error)
 
     def traceback(self):
         try:
             self_str = self._traceback_line()
         except Exception:
-            # If _traceback_line failed for whatever reason (e.g. there is no correct frame_info),
+            # If _traceback_line failed for whatever reason (e.g. there is no correct frame),
             # fall back to __str__ so that we can still provide useful information for debugging
             self_str = core_helpers.safe_str(self)
         if self.caller is None:
@@ -348,10 +264,12 @@ class AsyncTask(futures.FutureBase):
         return result
 
     def _traceback_line(self):
-        frame_info = self._frame_info
-        if frame_info is None and self._generator is not None:
-            frame_info = debug.get_frame_info(self._generator)
-        if frame_info is not None:
+        frame = self._frame
+        if frame is None and self._generator is not None:
+            frame = debug.get_frame(self._generator)
+
+        if frame is not None:
+            frame_info = inspect.getframeinfo(frame)
             template = '''File "%(file)s", line %(lineno)s, in %(funcname)s
     %(codeline)s'''
             return template % {
@@ -384,16 +302,9 @@ class AsyncTask(futures.FutureBase):
             if self.is_blocked():
                 status = 'blocked x%i' % len(self._dependencies)
             elif self.can_continue():
-                if self.is_scheduled:
-                    status = 'scheduled'
-                elif self.scheduler:
-                    status = 'waiting'
-                else:
-                    status = 'new'
+                status = 'waiting'
             else:
                 status = 'almost finished (generator is closed)'
-                if self.is_scheduled:
-                    status += ', scheduled'
         return '%s (%s, %s)' % (name, status, step)
 
     def dump(self, indent=0):
@@ -422,16 +333,19 @@ class AsyncTask(futures.FutureBase):
         self._contexts.remove(context)
 
     def _pause_contexts(self):
+        if not self._contexts_active:
+            return
+        self._contexts_active = False
         contexts = self._contexts
         i = len(contexts) - 1
-        # execute each __pause__() in a try/except and if 1 or more of them
+        # execute each pause() in a try/except and if 1 or more of them
         # raise an exception, then save the last exception raised so that it
         # can be re-raised later. We re-raise the last exception to make the
         # behavior consistent with __exit__.
         error = None
         while i >= 0:
             try:
-                contexts[i].__pause__()
+                contexts[i].pause()
             except BaseException as e:
                 error = e
                 core_errors.prepare_for_reraise(error)
@@ -440,6 +354,9 @@ class AsyncTask(futures.FutureBase):
             self._accept_error(error)
 
     def _resume_contexts(self):
+        if self._contexts_active:
+            return
+        self._contexts_active = True
         i = 0
         contexts = self._contexts
         l = len(contexts)
@@ -448,7 +365,7 @@ class AsyncTask(futures.FutureBase):
         error = None
         while i < l:
             try:
-                contexts[i].__resume__()
+                contexts[i].resume()
             except BaseException as e:
                 if error is None:
                     error = e
@@ -511,17 +428,20 @@ _empty_dictionary = dict()
 globals()['_empty_tuple'] = _empty_tuple
 globals()['_empty_dictionary'] = _empty_dictionary
 
-
-def _cancel_futures(value, error):
-    """Used by ``AsyncTask._continue`` to cancel evaluation of tasks
-    and futures due to failure of one of them.
-
-    """
+def extract_futures(value, result):
+    """Enumerates all the futures inside a particular value."""
     if value is None:
-        return
-    if isinstance(value, AsyncTask):
-        if not value.is_computed():
-            value._queue_throw_error(error)
+        pass
     elif isinstance(value, futures.FutureBase):
-        if not value.is_computed():
-            value.set_error(error)
+        result.append(value)
+    elif type(value) is tuple or type(value) is list:
+        # backwards because tasks are added to a stack, so the last one executes first
+        i = len(value) - 1
+        while i >= 0:
+            extract_futures(value[i], result)
+            i -= 1
+    elif type(value) is dict:
+        for item in six.itervalues(value):
+            extract_futures(item, result)
+    return result
+

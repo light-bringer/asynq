@@ -19,20 +19,22 @@ Helper functions for use with asynq (similar to itertools).
 """
 
 from .contexts import AsyncContext
-from .decorators import async, async_proxy, make_async_decorator, async_call
+from .decorators import async, async_proxy, async_call, AsyncDecorator, AsyncDecoratorBinder
 from .futures import ConstFuture
-from .scheduler import get_scheduler
 # we shouldn't use the return syntax in generators here so that asynq can be imported
 # under Python versions that lack our patch to allow returning from generators
 from .utils import result
 
 from qcore import get_original_fn, utime
-from qcore.caching import set_cached_per_instance_getstate, get_args_tuple, get_kwargs_defaults
+from qcore.caching import get_args_tuple, get_kwargs_defaults
 from qcore.inspection import getargspec
 from qcore.events import EventHook
 from qcore.errors import reraise, prepare_for_reraise
+from qcore.decorators import decorate
 import functools
 import itertools
+import weakref
+import threading
 
 
 @async()
@@ -170,30 +172,36 @@ def acached_per_instance():
         arg_names = argspec.args[1:]  # remove self
         async_fun = fun.async
         kwargs_defaults = get_kwargs_defaults(argspec)
+        cache = {}
 
         def cache_key(args, kwargs):
-            args = get_args_tuple(args, kwargs, arg_names, kwargs_defaults)
-            return (fun.__module__, fun.__name__, args)
+            return get_args_tuple(args, kwargs, arg_names, kwargs_defaults)
+
+        def clear_cache(instance_key, ref):
+            del cache[instance_key]
 
         @async_proxy()
         @functools.wraps(fun)
         def new_fun(self, *args, **kwargs):
-            try:
-                cache = self.__lib_cache
-            except AttributeError:
-                cache = self.__lib_cache = {}
-                set_cached_per_instance_getstate(self)
+            instance_key = id(self)
+            if instance_key not in cache:
+                ref = weakref.ref(self, functools.partial(clear_cache, instance_key))
+                cache[instance_key] = (ref, {})
+            instance_cache = cache[instance_key][1]
 
             k = cache_key(args, kwargs)
             try:
-                return ConstFuture(cache[k])
+                return ConstFuture(instance_cache[k])
             except KeyError:
                 def callback(task):
-                    cache[k] = task.value()
+                    instance_cache[k] = task.value()
 
                 task = async_fun(self, *args, **kwargs)
                 task.on_computed.subscribe(callback)
                 return task
+
+        # just so unit tests can check that this is cleaned up correctly
+        new_fun.__acached_per_instance_cache__ = cache
         return new_fun
     return cache_fun
 
@@ -215,8 +223,47 @@ def call_with_context(context, fn, *args, **kwargs):
         result((yield fn.async(*args, **kwargs))); return
 
 
-def deduplicate():
-    """Decorator that (mostly) ensures that no two identical instances of a task run concurrently.
+class DeduplicateDecoratorBinder(AsyncDecoratorBinder):
+    def dirty(self, *args, **kwargs):
+        if self.instance is None:
+            self.decorator.dirty(*args, **kwargs)
+        else:
+            self.decorator.dirty(self.instance, *args, **kwargs)
+
+
+class DeduplicateDecorator(AsyncDecorator):
+    binder_cls = DeduplicateDecoratorBinder
+    tasks = {}
+
+    def __init__(self, fn, task_cls, keygetter):
+        AsyncDecorator.__init__(self, fn, task_cls)
+        self.keygetter = keygetter
+
+    def cache_key(self, args, kwargs):
+        return self.keygetter(args, kwargs), threading.current_thread()
+
+    def async(self, *args, **kwargs):
+        cache_key = self.cache_key(args, kwargs)
+
+        try:
+            return self.tasks[cache_key]
+        except KeyError:
+            task = self.fn.async(*args, **kwargs)
+
+            def callback(task):
+                del self.tasks[cache_key]
+
+            self.tasks[cache_key] = task
+            task.on_computed.subscribe(callback)
+            return task
+
+    def dirty(self, *args, **kwargs):
+        cache_key = self.cache_key(args, kwargs)
+        self.tasks.pop(cache_key, None)
+
+
+def deduplicate(keygetter=None):
+    """Decorator that ensures that no two identical instances of a task run concurrently.
 
     This is useful in situations like this:
 
@@ -234,39 +281,21 @@ def deduplicate():
     despite the caching, because a second async task may enter the body while the first one is
     still active.
 
-    This decorator will *not* deduplicate tasks that are scheduled on different asynq schedulers. In
-    practice, this can happen when the await recursion depth (the number of async tasks that call
-    .value() on async tasks) reaches 10 (see scheduler.py). If we attempt to deduplicate across
-    multiple schedulers, the scheduler may end up being blocked on a future that is owned by a
-    different scheduler, and this will lead the scheduler to fail with "No task to continue or batch
-    to flush".
+    You can also call dirty on a deduplicated function to remove a cached async task with the
+    corresponding args and kwargs. This is useful if a deduplicating function ends up calling
+    itself with the same args and kwargs, either directly or deeper in the call stack.
 
     """
     def decorator(fun):
-        original_fn = get_original_fn(fun)
-        argspec = getargspec(original_fn)
-        arg_names = argspec.args
-        kwargs_defaults = get_kwargs_defaults(argspec)
-        tasks = {}
-        async_fn = fun.async
+        _keygetter = keygetter
+        if _keygetter is None:
+            original_fn = get_original_fn(fun)
+            argspec = getargspec(original_fn)
+            arg_names = argspec.args
+            kwargs_defaults = get_kwargs_defaults(argspec)
+            _keygetter = lambda args, kwargs: get_args_tuple(args, kwargs, arg_names, kwargs_defaults)
 
-        def wrapper_fn(*args, **kwargs):
-            # see docstring for why scheduler is in the cache key
-            cache_key = get_args_tuple(args, kwargs, arg_names, kwargs_defaults), get_scheduler()
-
-            try:
-                return tasks[cache_key]
-            except KeyError:
-                task = async_fn(*args, **kwargs)
-
-                def callback(task):
-                    del tasks[cache_key]
-
-                tasks[cache_key] = task
-                task.on_computed.subscribe(callback)
-                return task
-
-        return make_async_decorator(fun, wrapper_fn, 'deduplicate')
+        return decorate(DeduplicateDecorator, fun.task_cls, _keygetter)(fun)
     return decorator
 
 

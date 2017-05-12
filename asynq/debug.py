@@ -19,6 +19,7 @@ import qcore
 import inspect
 import linecache
 import traceback
+import logging
 from sys import stderr, stdout
 
 from . import _debug
@@ -27,7 +28,6 @@ options = _debug.options  # Must be the same object
 
 options.DUMP_PRE_ERROR_STATE  = True
 options.DUMP_EXCEPTIONS       = False
-options.DUMP_AWAIT_RECURSION  = False
 options.DUMP_SCHEDULE_TASK    = False
 options.DUMP_CONTINUE_TASK    = False
 options.DUMP_SCHEDULE_BATCH   = False
@@ -38,15 +38,15 @@ options.DUMP_NEW_TASKS        = False
 options.DUMP_YIELD_RESULTS    = False
 options.DUMP_QUEUED_RESULTS   = False
 options.DUMP_CONTEXTS         = False
-options.DUMP_SCHEDULER_CHANGE = False
 options.DUMP_SYNC             = False
-options.DUMP_PRIMER           = False
 options.DUMP_STACK            = False  # When it's meaningful, e.g. on batch flush
 options.DUMP_SCHEDULER_STATE  = False
+options.DUMP_SYNC_CALLS       = False
 
-options.SCHEDULER_STATE_DUMP_INTERVAL = 1    # In seconds
-options.DEBUG_STR_REPR_MAX_LENGTH     = 240  # In characters, 0 means infinity
-options.STACK_DUMP_LIMIT              = 10   # In frames, None means infinity
+options.SCHEDULER_STATE_DUMP_INTERVAL = 1       # In seconds
+options.DEBUG_STR_REPR_MAX_LENGTH     = 240     # In characters, 0 means infinity
+options.STACK_DUMP_LIMIT              = 10      # In frames, None means infinity
+options.MAX_TASK_STACK_SIZE           = 1000000 # Max number of concurrent futures + batch items
 
 options.ENABLE_COMPLEX_ASSERTIONS = True
 
@@ -80,8 +80,18 @@ def format_error(error, tb=None):
         tb = tb or error._traceback
         result += '\n\nTraceback:\n%s' % ''.join(format_tb(tb))
     if isinstance(error, BaseException):
-        result += '\n' + ''.join(traceback.format_exception_only(error.__class__, error))
+        exc_text = ''.join(traceback.format_exception_only(error.__class__, error))
+        if isinstance(exc_text, bytes):
+            exc_text = exc_text.decode('utf-8', 'replace')
+        result += '\n' + exc_text
     return result
+
+
+class AsynqStackTracebackFormatter(logging.Formatter):
+    """Prints traceback skipping asynq frames during logger.exception/error usages."""
+    def formatException(self, exc_info):
+        ty, val, tb = exc_info
+        return format_error(val, tb=tb)
 
 
 def _should_skip_frame(frame):
@@ -256,8 +266,8 @@ def sync():
     assert False, "'import asynq' seems broken: this function must be replaced with async.batching.sync."
 
 
-def get_frame_info(generator):
-    """Given a generator, returns its current frame info."""
+def get_frame(generator):
+    """Given a generator, returns its current frame."""
     if getattr(generator, 'gi_frame', None) is not None:
-        return inspect.getframeinfo(generator.gi_frame)
+        return generator.gi_frame
     return None

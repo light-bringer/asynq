@@ -148,18 +148,31 @@ class AsyncObject(object):
         AsyncObject.cls_value += val
 
 
-def test_acached_per_instance():
-    obj = AsyncObject()
-    assert_eq(1, obj.get_value(0))
-    assert_eq(1, obj.get_value(0))
-    assert_eq(2, obj.get_value(1))
-    assert_eq(1, obj.get_value(0))
-    assert_eq(1, obj.get_value(index=0))
-    assert_eq(1, obj.get_value.async(index=0).value())
+class UnhashableAcached(AsyncObject):
+    __hash__ = None
 
-    assert_eq(8, obj.with_kwargs())
-    assert_eq(8, obj.with_kwargs(z=3))
-    assert_eq(17, obj.with_kwargs(x=3, y=3))
+
+def test_acached_per_instance():
+    for cls in (AsyncObject, UnhashableAcached):
+        obj = cls()
+        cache = type(obj).get_value.decorator.__acached_per_instance_cache__
+        assert_eq(0, len(cache), extra=repr(cache))
+
+        assert_eq(1, obj.get_value(0))
+        assert_eq(1, obj.get_value(0))
+        assert_eq(2, obj.get_value(1))
+        assert_eq(1, obj.get_value(0))
+        assert_eq(1, obj.get_value(index=0))
+        assert_eq(1, obj.get_value.async(index=0).value())
+
+        assert_eq(8, obj.with_kwargs())
+        assert_eq(8, obj.with_kwargs(z=3))
+        assert_eq(17, obj.with_kwargs(x=3, y=3))
+
+        assert_eq(1, len(cache), extra=repr(cache))
+
+        del obj
+        assert_eq(0, len(cache), extra=repr(cache))
 
 
 class Ctx(AsyncContext):
@@ -200,6 +213,17 @@ def recursive_incrementer(n):
     result(recursive_incrementer(n - 1)); return
 
 
+@deduplicate()
+@async()
+def recursive_call_with_dirty():
+    global i
+    if i > 0:
+        result(i); return
+    i += 1
+    recursive_call_with_dirty.dirty()
+    yield recursive_call_with_dirty.async()
+
+
 def test_deduplicate():
     _check_deduplicate()
 
@@ -223,6 +247,10 @@ def _check_deduplicate():
     yield AsyncObject.deduplicated_static_method.async(), \
         AsyncObject.deduplicated_static_method.async(1)
     assert_eq(1, AsyncObject.cls_value)
+
+    i = 0
+    yield recursive_call_with_dirty.async()
+
 
 
 def test_deduplicate_recursion():
